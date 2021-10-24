@@ -1,0 +1,63 @@
+name: gcloud
+on: [push]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Record build start
+        run: echo "BUILD_START=$(date -Iseconds)" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 50
+      - name: Build and submit release
+        run: |
+          # Build a docker container
+          docker build -t reliza-hub-landing .
+          # Extract actual app from container
+          docker create --name reliza-hub-landing-container reliza-hub-landing
+          docker cp reliza-hub-landing-container://usr/share/nginx/html deployment
+          # inject app yaml for google app engine
+          cp app.yaml deployment/
+      - uses: actions-hub/gcloud@master
+        env:
+          PROJECT_ID: ${{secrets.GCLOUD_PROJECT_ID}}
+          APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+        with:
+          args: app deploy deployment/app.yaml --no-promote > result_of_deployment 2>&1
+      - name: Extract Last Release Commit And Prepare List Of Commits
+        run: |
+          last_commit=$(docker run --rm relizaio/reliza-cli getlatestrelease -i ${{ secrets.RELIZA_API_ID }} -k ${{ secrets.RELIZA_API_KEY }} --branch $GITHUB_REF | jq -r ".sourceCodeEntryDetails.commit")
+          if [ ! -z "$last_commit" ]
+          then
+            echo -n "--commits $(git log $last_commit..$GITHUB_SHA --date=iso-strict --pretty='%H|||%ad|||%s' | base64 -w 0) " >> reliza_command
+          fi
+      - name: Submit metadata to Reliza Hub
+        run: |
+          # list results of dpeloyment for debug purposes
+          cat result_of_deployment
+          # get google app engine version which we would use as digest also
+          google_ver=$(cat result_of_deployment | grep version | cut -d '[' -f 2 | sed "s/]//")
+          echo $google_ver
+          # get target url
+          target_url=$(cat result_of_deployment | grep 'target url' | cut -d '[' -f 2 | sed "s/]//")
+          # compute build end time
+          build_end=$(date -Iseconds)
+          # submit release details to RELIZA HUB
+          # first artifact here essentially points to git sha1
+          # while second artifact is Google App Engine deployment
+          echo -n "-b $GITHUB_REF --commit $GITHUB_SHA -v $google_ver --commitmessage \"$(git log -1 --pretty='%s')\" \
+            -i ${{ secrets.RELIZA_API_ID }} -k ${{ secrets.RELIZA_API_KEY }} \
+            --date $(git log -1 --date=iso-strict --pretty='%ad') --endpoint $target_url \
+            --artid google-app-engine-deployment-$google_ver --artbuildid github$GITHUB_ACTION$GITHUB_SHA \
+            --artbuilduri https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID --artcimeta GitHub Actions \
+            --arttype Application --artdigests version:$google_ver --datestart $BUILD_START --dateend $build_end --artversion $google_ver \
+            --tagkey deployment --tagval true " >> reliza_command
+          # debug
+          cat reliza_command
+          # send data
+          echo docker run --rm relizaio/reliza-cli addrelease $(cat reliza_command) > rlz_cmd_exec
+          eval $(cat rlz_cmd_exec)

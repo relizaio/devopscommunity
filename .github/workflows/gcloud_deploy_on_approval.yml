@@ -1,0 +1,51 @@
+name: gcloud deploy on approval
+on:
+  repository_dispatch:
+    types: [reliza-build-event]
+
+jobs:
+  deploy:
+    name: Promote
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Retrieve production approved version
+        run: |
+          docker run --rm relizaio/reliza-cli    \
+            getlatestrelease    \
+            -i ${{ secrets.RELIZA_API_ID }}    \
+            -k ${{ secrets.RELIZA_API_KEY }}    \
+            --project 42538761-393e-4565-810e-58c27f676aed    \
+            --branch main    \
+            --env PRODUCTION
+          reliza_ver=$(docker run --rm relizaio/reliza-cli    \
+            getlatestrelease    \
+            -i ${{ secrets.RELIZA_API_ID }}    \
+            -k ${{ secrets.RELIZA_API_KEY }}    \
+            --project 42538761-393e-4565-810e-58c27f676aed    \
+            --branch main    \
+            --env PRODUCTION)
+          google_ver=$(echo $reliza_ver | jq -r ".artifactDetails[0].version")
+          echo "GOOGLE_VERSION=$google_ver" >> $GITHUB_ENV
+      - name: Switch App Engine Traffic to new version
+        uses: actions-hub/gcloud@master
+        env:
+          PROJECT_ID: ${{secrets.GCLOUD_PROJECT_ID}}
+          APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+        with:
+          args: app services set-traffic community --splits $GOOGLE_VERSION=1 --quiet
+      - name: Retrieve version deployed to google app engine
+        uses: actions-hub/gcloud@master
+        env:
+          PROJECT_ID: ${{secrets.GCLOUD_PROJECT_ID}}
+          APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+        with:
+          args: app versions list --service=community | grep ' 1.00 ' | awk '{print $2}' > deployed_version
+      - name: Send instance data to Reliza Hub instance
+        run: |
+          # debug - show deployed version
+          cat deployed_version
+          # send data
+          docker run --rm relizaio/reliza-cli instdata \
+            -i ${{ secrets.RELIZA_API_INSTANCE_ID }} -k ${{ secrets.RELIZA_API_INSTANCE_KEY }} \
+            --images "version:$(cat deployed_version)"
